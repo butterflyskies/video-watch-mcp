@@ -11,6 +11,7 @@ Three tools:
 import modal
 import base64
 import json
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -20,9 +21,10 @@ image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("ffmpeg", "curl")
     .pip_install(
-        "yt-dlp",
+        "yt-dlp>=2025.06.09",  # Pin recent version — bump date to bust Modal image cache
         "curl_cffi",  # For browser impersonation (TikTok, Instagram, etc.)
         "brotli",     # For compression support
+        "youtube-transcript-api",  # Fallback transcript source (no download needed)
         "openai-whisper",
         "torch",
         "mcp[cli]",
@@ -43,12 +45,42 @@ def download_video(url: str, video_path: str) -> dict:
         "-o", video_path,
         "--no-playlist",
         "--impersonate", "chrome",
+        "--extractor-args", "youtube:player_client=android_creator,mediaconnect",
         url
     ], capture_output=True, text=True)
 
     if result.returncode != 0:
         return {"success": False, "error": result.stderr}
     return {"success": True}
+
+
+def extract_youtube_id(url: str) -> str | None:
+    """Extract YouTube video ID from URL, or None if not a YouTube URL."""
+    patterns = [
+        r'(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/|youtube\.com/shorts/)([a-zA-Z0-9_-]{11})',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+
+def fetch_transcript_fallback(url: str) -> dict:
+    """Try to get transcript via youtube-transcript-api when yt-dlp fails.
+    Only works for YouTube URLs. Returns dict with success/transcript/error."""
+    video_id = extract_youtube_id(url)
+    if not video_id:
+        return {"success": False, "error": "Not a YouTube URL — transcript fallback unavailable"}
+
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+        transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
+        full_text = " ".join(entry["text"] for entry in transcript_list)
+        duration = transcript_list[-1]["start"] + transcript_list[-1]["duration"] if transcript_list else 0
+        return {"success": True, "transcript": full_text, "duration_seconds": duration}
+    except Exception as e:
+        return {"success": False, "error": f"Transcript API fallback failed: {e}"}
 
 
 def get_duration(video_path: str) -> float:
@@ -118,7 +150,17 @@ def process_listen(url: str):
 
         dl = download_video(url, video_path)
         if not dl["success"]:
-            return {"success": False, "error": dl["error"]}
+            # Fallback: try youtube-transcript-api (no download needed)
+            fallback = fetch_transcript_fallback(url)
+            if fallback["success"]:
+                return {
+                    "success": True,
+                    "duration_seconds": fallback.get("duration_seconds", 0),
+                    "transcript": fallback["transcript"],
+                    "url": url,
+                    "note": "Used transcript API fallback (video download failed)"
+                }
+            return {"success": False, "error": f"Download failed: {dl['error']}\nTranscript fallback also failed: {fallback['error']}"}
 
         duration = get_duration(video_path)
 
@@ -170,7 +212,19 @@ def process_watch(url: str, max_frames: int = 5):
 
         dl = download_video(url, video_path)
         if not dl["success"]:
-            return {"success": False, "error": dl["error"]}
+            # Fallback: try transcript-only via API (no frames, but better than nothing)
+            fallback = fetch_transcript_fallback(url)
+            if fallback["success"]:
+                return {
+                    "success": True,
+                    "duration_seconds": fallback.get("duration_seconds", 0),
+                    "frame_count": 0,
+                    "frames": [],
+                    "transcript": fallback["transcript"],
+                    "url": url,
+                    "note": "Used transcript API fallback — no frames available (video download failed)"
+                }
+            return {"success": False, "error": f"Download failed: {dl['error']}\nTranscript fallback also failed: {fallback['error']}"}
 
         duration = get_duration(video_path)
         frames = extract_frames(video_path, frames_dir, fps=0.5, max_frames=max_frames)
@@ -291,7 +345,7 @@ def mcp_server():
 
             # Route to appropriate processor
             if tool_name == "video_listen":
-                result = process_listen.remote(url)
+                result = await process_listen.remote.aio(url)
 
                 if not result.get("success"):
                     return JSONResponse({
@@ -300,14 +354,15 @@ def mcp_server():
                         "result": {"content": [{"type": "text", "text": f"Error: {result.get('error')}"}]}
                     })
 
+                note = f"\n**Note:** {result['note']}" if result.get("note") else ""
                 content = [{
                     "type": "text",
-                    "text": f"**Video:** {url}\n**Duration:** {format_duration(result.get('duration_seconds', 0))}\n\n**Transcript:**\n{result.get('transcript', '[No transcript]')}"
+                    "text": f"**Video:** {url}\n**Duration:** {format_duration(result.get('duration_seconds', 0))}{note}\n\n**Transcript:**\n{result.get('transcript', '[No transcript]')}"
                 }]
 
             elif tool_name == "video_see":
                 max_frames = min(args.get("max_frames", 5), 10)
-                result = process_see.remote(url, max_frames)
+                result = await process_see.remote.aio(url, max_frames)
 
                 if not result.get("success"):
                     return JSONResponse({
@@ -326,7 +381,7 @@ def mcp_server():
 
             elif tool_name == "watch_video":
                 max_frames = min(args.get("max_frames", 5), 10)
-                result = process_watch.remote(url, max_frames)
+                result = await process_watch.remote.aio(url, max_frames)
 
                 if not result.get("success"):
                     return JSONResponse({
@@ -335,9 +390,10 @@ def mcp_server():
                         "result": {"content": [{"type": "text", "text": f"Error: {result.get('error')}"}]}
                     })
 
+                note = f"\n**Note:** {result['note']}" if result.get("note") else ""
                 content = [{
                     "type": "text",
-                    "text": f"**Video:** {url}\n**Duration:** {format_duration(result.get('duration_seconds', 0))}\n**Frames:** {result.get('frame_count', 0)}\n\n**Transcript:**\n{result.get('transcript', '[No transcript]')}"
+                    "text": f"**Video:** {url}\n**Duration:** {format_duration(result.get('duration_seconds', 0))}\n**Frames:** {result.get('frame_count', 0)}{note}\n\n**Transcript:**\n{result.get('transcript', '[No transcript]')}"
                 }]
 
                 for frame_b64 in result.get("frames", []):
