@@ -345,7 +345,7 @@ def mcp_server():
 
             # Route to appropriate processor
             if tool_name == "video_listen":
-                result = process_listen.remote(url)
+                result = await process_listen.remote.aio(url)
 
                 if not result.get("success"):
                     return JSONResponse({
@@ -362,7 +362,7 @@ def mcp_server():
 
             elif tool_name == "video_see":
                 max_frames = min(args.get("max_frames", 5), 10)
-                result = process_see.remote(url, max_frames)
+                result = await process_see.remote.aio(url, max_frames)
 
                 if not result.get("success"):
                     return JSONResponse({
@@ -381,7 +381,7 @@ def mcp_server():
 
             elif tool_name == "watch_video":
                 max_frames = min(args.get("max_frames", 5), 10)
-                result = process_watch.remote(url, max_frames)
+                result = await process_watch.remote.aio(url, max_frames)
 
                 if not result.get("success"):
                     return JSONResponse({
