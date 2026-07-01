@@ -21,8 +21,7 @@ image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("ffmpeg", "curl")
     .run_commands(
-        "curl -fsSL https://deno.land/install.sh | sh",
-        "ln -s /root/.deno/bin/deno /usr/local/bin/deno",
+        "apt-get update && apt-get install -y unzip && curl -fsSL https://deno.land/install.sh | sh && ln -s /root/.deno/bin/deno /usr/local/bin/deno",
     )
     .pip_install(
         "yt-dlp>=2025.06.09",  # Pin recent version — bump date to bust Modal image cache
