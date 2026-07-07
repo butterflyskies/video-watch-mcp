@@ -20,11 +20,14 @@ from pathlib import Path
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("ffmpeg", "curl")
+    .run_commands(
+        "apt-get update && apt-get install -y unzip && curl -fsSL https://deno.land/install.sh | sh && ln -s /root/.deno/bin/deno /usr/local/bin/deno",
+    )
     .pip_install(
         "yt-dlp>=2025.06.09",  # Pin recent version — bump date to bust Modal image cache
         "curl_cffi",  # For browser impersonation (TikTok, Instagram, etc.)
         "brotli",     # For compression support
-        "youtube-transcript-api",  # Fallback transcript source (no download needed)
+        "youtube-transcript-api>=1.0.0",  # v1.0+ API (fetch instead of get_transcript)
         "openai-whisper",
         "torch",
         "mcp[cli]",
@@ -75,9 +78,11 @@ def fetch_transcript_fallback(url: str) -> dict:
 
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
-        transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
-        full_text = " ".join(entry["text"] for entry in transcript_list)
-        duration = transcript_list[-1]["start"] + transcript_list[-1]["duration"] if transcript_list else 0
+        ytt_api = YouTubeTranscriptApi()
+        transcript = ytt_api.fetch(video_id)
+        snippets = list(transcript)
+        full_text = " ".join(snippet.text for snippet in snippets)
+        duration = snippets[-1].start + snippets[-1].duration if snippets else 0
         return {"success": True, "transcript": full_text, "duration_seconds": duration}
     except Exception as e:
         return {"success": False, "error": f"Transcript API fallback failed: {e}"}
